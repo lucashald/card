@@ -3,8 +3,15 @@ import { Text, View, StyleSheet, TouchableOpacity, Alert } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Buffer } from 'buffer';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+// Import TensorFlow.js and COCO-SSD
+import * as tf from '@tensorflow/tfjs';
+import '@tensorflow/tfjs-react-native';
+import '@tensorflow/tfjs-backend-cpu';
+import '@tensorflow/tfjs-backend-webgl';
+import * as cocoSsd from '@tensorflow-models/coco-ssd';
+import { decodeJpeg } from '@tensorflow/tfjs-react-native';
 
-const GEMINI_API_KEY = 'your_gemini_api_key_here'; // Replace with your actual Gemini API key
+const GEMINI_API_KEY = 'add your Gemini API key here';
 
 export default function App() {
   const cameraRef = useRef(null);
@@ -14,22 +21,130 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastPrediction, setLastPrediction] = useState(null);
   const [geminiReady, setGeminiReady] = useState(false);
+  const [autoDetection, setAutoDetection] = useState(false);
+  const [tensorflowReady, setTensorflowReady] = useState(false);
+  
   const genAI = useRef(null);
   const model = useRef(null);
+  const cocoModel = useRef(null);
+  const intervalRef = useRef(null);
+  const lastCardDetected = useRef(null);
+  const lastObjectState = useRef(null);
 
+  // Initialize TensorFlow and models
   useEffect(() => {
-    try {
-      if (!GEMINI_API_KEY || GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY') {
-        throw new Error('Gemini API key is not set. Please add your key.');
+    const initializeModels = async () => {
+      try {
+        // Initialize TensorFlow.js platform for React Native
+        await tf.ready();
+        console.log('TensorFlow.js is ready!');
+        console.log('Platform: ', tf.getBackend());
+
+        // Load COCO-SSD model
+        cocoModel.current = await cocoSsd.load();
+        console.log('COCO-SSD model loaded!');
+        setTensorflowReady(true);
+
+        // Initialize Gemini
+        if (!GEMINI_API_KEY || GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY') {
+          throw new Error('Gemini API key is not set. Please add your key.');
+        }
+        genAI.current = new GoogleGenerativeAI(GEMINI_API_KEY);
+        model.current = genAI.current.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
+        setGeminiReady(true);
+        console.log('All models initialized!');
+
+      } catch (error) {
+        console.error('Error initializing models:', error);
+        Alert.alert('Initialization Error', 'Failed to load detection models. Check console for details.');
       }
-      genAI.current = new GoogleGenerativeAI(GEMINI_API_KEY);
-      model.current = genAI.current.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
-      setGeminiReady(true);
-    } catch (error) {
-      console.error('Error initializing Gemini API:', error);
-      Alert.alert('API Error', 'Failed to initialize Gemini API. Check your API key.');
-    }
+    };
+
+    initializeModels();
   }, []);
+
+  // Detect card-like objects using COCO-SSD
+  const detectObjects = async (base64String) => {
+    if (!cocoModel.current) return null;
+
+    try {
+      // Convert base64 to Uint8Array
+      const imageBuffer = Buffer.from(base64String, 'base64');
+      const uint8Array = new Uint8Array(imageBuffer);
+      
+      // Decode JPEG to tensor using TensorFlow.js React Native
+      const imageTensor = decodeJpeg(uint8Array);
+      
+      const predictions = await cocoModel.current.detect(imageTensor);
+      
+      // Clean up tensor
+      imageTensor.dispose();
+      
+      // Filter for card-like objects (books, paper, etc.)
+      const cardLikeObjects = predictions.filter(prediction => {
+        const className = prediction.class.toLowerCase();
+        return (
+          className.includes('book') ||
+          className.includes('paper') ||
+          className.includes('magazine') ||
+          // Add more relevant classes that might detect cards
+          (prediction.score > 0.3 && // Reasonable confidence
+           prediction.bbox[2] > 50 && // Width > 50px
+           prediction.bbox[3] > 70 && // Height > 70px
+           prediction.bbox[2] / prediction.bbox[3] > 0.5 && // Not too thin
+           prediction.bbox[2] / prediction.bbox[3] < 2) // Not too wide
+        );
+      });
+
+      return cardLikeObjects;
+    } catch (error) {
+      console.error('COCO-SSD detection error:', error);
+      return null;
+    }
+  };
+
+  // Check if object state has changed significantly
+  const hasObjectStateChanged = (currentObjects) => {
+    const currentState = {
+      count: currentObjects ? currentObjects.length : 0,
+      positions: currentObjects ? currentObjects.map(obj => ({
+        x: Math.round(obj.bbox[0] / 30) * 30, // Quantize position to reduce noise
+        y: Math.round(obj.bbox[1] / 30) * 30,
+        w: Math.round(obj.bbox[2] / 30) * 30,
+        h: Math.round(obj.bbox[3] / 30) * 30
+      })) : []
+    };
+
+    if (!lastObjectState.current) {
+      lastObjectState.current = currentState;
+      return currentState.count > 0; // Changed if we now detect objects
+    }
+
+    // Check if count changed
+    if (currentState.count !== lastObjectState.current.count) {
+      lastObjectState.current = currentState;
+      return true;
+    }
+
+    // Check if positions changed significantly (for same count)
+    if (currentState.count > 0) {
+      const positionsChanged = !currentState.positions.every((pos, index) => {
+        const lastPos = lastObjectState.current.positions[index];
+        if (!lastPos) return false;
+        const distance = Math.sqrt(
+          Math.pow(pos.x - lastPos.x, 2) + Math.pow(pos.y - lastPos.y, 2)
+        );
+        return distance < 60; // Allow some movement tolerance
+      });
+
+      if (positionsChanged) {
+        lastObjectState.current = currentState;
+        return true;
+      }
+    }
+
+    return false;
+  };
 
   const fileToGenerativePart = (base64String) => {
     return {
@@ -41,28 +156,56 @@ export default function App() {
   };
 
   const predictCard = async (imageBase64) => {
-    if (!geminiReady || isProcessing) return;
+    if (!geminiReady || !tensorflowReady || isProcessing) return;
 
     setIsProcessing(true);
 
     try {
+      // First, check for card-like objects using COCO-SSD
+      const detectedObjects = await detectObjects(imageBase64);
+      
+      // Only proceed with Gemini if object state changed
+      if (!hasObjectStateChanged(detectedObjects)) {
+        console.log('No significant object changes detected, skipping API call');
+        setIsProcessing(false);
+        return;
+      }
+
+      console.log(`Detected ${detectedObjects?.length || 0} card-like objects, calling Gemini...`);
+
       const imagePart = fileToGenerativePart(imageBase64);
       const prompt = "What playing card is visible in this image? Respond only with the card's name, like 'Ace of Spades' or 'Jack of Hearts'. If no playing card is clearly visible, respond with 'Not a card'.";
       const result = await model.current.generateContent([prompt, imagePart]);
       const response = await result.response;
       const text = response.text().trim();
 
+      // Skip if it's the same card as last time
+      if (text === lastCardDetected.current) {
+        console.log('Same card detected, skipping notification');
+        setIsProcessing(false);
+        return;
+      }
+
+      lastCardDetected.current = text;
+
       const resultObject = {
         card: text,
         confidence: text === 'Not a card' ? 'N/A' : 'High',
+        objectsDetected: detectedObjects?.length || 0
       };
 
       setLastPrediction(resultObject);
-      triggerCardDetection(resultObject);
+      
+      // Only show alert for actual cards
+      if (text !== 'Not a card') {
+        triggerCardDetection(resultObject);
+      }
 
     } catch (error) {
-      console.error('Error predicting card with Gemini:', error);
-      Alert.alert('Prediction Error', 'Failed to analyze image with Gemini.');
+      console.error('Error predicting card:', error);
+      if (!autoDetection) {
+        Alert.alert('Prediction Error', 'Failed to analyze image.');
+      }
     } finally {
       setIsProcessing(false);
     }
@@ -70,8 +213,8 @@ export default function App() {
 
   const triggerCardDetection = (prediction) => {
     Alert.alert(
-      '🎴 Card Detected!',
-      `${prediction.card}\nConfidence: ${prediction.confidence}`,
+      '🎴 New Card Detected!',
+      `${prediction.card}\nConfidence: ${prediction.confidence}\nObjects detected: ${prediction.objectsDetected}`,
       [{ text: 'OK', style: 'default' }]
     );
   };
@@ -80,36 +223,81 @@ export default function App() {
     setCameraReady(true);
   };
 
-  const captureAndAnalyze = async () => {
-    if (!cameraReady || !geminiReady || isProcessing) {
+  const captureAndAnalyze = async (isAutoCapture = false) => {
+    if (!cameraReady || !geminiReady || !tensorflowReady || (isProcessing && !isAutoCapture)) {
       return;
     }
 
     try {
       if (!cameraRef.current) {
-        Alert.alert('Camera Error', 'Camera not ready to capture a photo.');
+        if (!isAutoCapture) {
+          Alert.alert('Camera Error', 'Camera not ready to capture a photo.');
+        }
         return;
       }
 
       const photo = await cameraRef.current.takePictureAsync({
         base64: true,
-        quality: 1.0,
+        quality: 0.8,
       });
 
       if (!photo?.base64) {
-        Alert.alert('Capture Error', 'Failed to obtain image data from camera.');
+        if (!isAutoCapture) {
+          Alert.alert('Capture Error', 'Failed to obtain image data from camera.');
+        }
         return;
       }
+
       await predictCard(photo.base64);
 
     } catch (error) {
       console.error('Error capturing image:', error);
-      Alert.alert('Error', 'Failed to capture image');
+      if (!isAutoCapture) {
+        Alert.alert('Error', 'Failed to capture image');
+      }
     }
   };
 
+  const toggleAutoDetection = () => {
+    if (autoDetection) {
+      // Stop auto detection
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      setAutoDetection(false);
+      lastObjectState.current = null;
+      lastCardDetected.current = null;
+    } else {
+      // Start auto detection
+      if (!tensorflowReady || !geminiReady) {
+        Alert.alert('Not Ready', 'Please wait for all models to load before starting auto-detection.');
+        return;
+      }
+      
+      setAutoDetection(true);
+      intervalRef.current = setInterval(() => {
+        if (cameraReady && geminiReady && tensorflowReady && !isProcessing) {
+          captureAndAnalyze(true);
+        }
+      }, 1500); // Check every 1.5 seconds
+    }
+  };
+
+  // Cleanup interval on unmount
+  useEffect(() => {
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, []);
+
   function toggleCameraFacing() {
     setFacing(current => (current === 'back' ? 'front' : 'back'));
+    // Reset detection state when switching cameras
+    lastObjectState.current = null;
+    lastCardDetected.current = null;
   }
 
   if (!permission) {
@@ -133,12 +321,14 @@ export default function App() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Card Detection Camera</Text>
+      <Text style={styles.title}>Smart Card Detection Camera</Text>
 
       <View style={styles.statusContainer}>
         <Text style={styles.statusText}>
-          API: {geminiReady ? '✅' : '⏳'} |
-          Camera: {cameraReady ? '✅' : '⏳'}
+          TensorFlow: {tensorflowReady ? '✅' : '⏳'} |
+          Gemini: {geminiReady ? '✅' : '⏳'} |
+          Camera: {cameraReady ? '✅' : '⏳'} |
+          Auto: {autoDetection ? '🔄' : '⏸️'}
         </Text>
       </View>
 
@@ -153,14 +343,17 @@ export default function App() {
         <View style={styles.targetFrame}>
           <Text style={styles.overlayText}>
             {!cameraReady ? 'Starting camera...' :
+             !tensorflowReady ? 'Loading TensorFlow...' :
              !geminiReady ? 'Connecting to API...' :
              isProcessing ? 'Processing image...' :
-             'Point cards in green frame'}
+             autoDetection ? 'Smart detection active' :
+             'Ready for detection'}
           </Text>
 
           {lastPrediction && (
             <Text style={styles.predictionText}>
-              Last: {lastPrediction.card} ({lastPrediction.confidence})
+              Last: {lastPrediction.card} 
+              {lastPrediction.objectsDetected > 0 && ` (${lastPrediction.objectsDetected} objects)`}
             </Text>
           )}
         </View>
@@ -171,12 +364,22 @@ export default function App() {
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={[styles.captureButton, isProcessing && styles.disabledButton]}
-            onPress={captureAndAnalyze}
-            disabled={!cameraReady || !geminiReady || isProcessing}
+            style={[styles.autoButton, autoDetection && styles.activeButton]}
+            onPress={toggleAutoDetection}
+            disabled={!cameraReady || !geminiReady || !tensorflowReady}
           >
             <Text style={styles.buttonText}>
-              {isProcessing ? 'Processing...' : 'Detect Card'}
+              {autoDetection ? 'Stop Auto' : 'Start Auto'}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.captureButton, isProcessing && styles.disabledButton]}
+            onPress={captureAndAnalyze}
+            disabled={!cameraReady || !geminiReady || !tensorflowReady || isProcessing}
+          >
+            <Text style={styles.buttonText}>
+              {isProcessing ? 'Processing...' : 'Detect Now'}
             </Text>
           </TouchableOpacity>
         </View>
@@ -269,7 +472,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     backgroundColor: 'transparent',
     margin: 20,
-    gap: 15,
+    gap: 10,
+    flexWrap: 'wrap',
+    justifyContent: 'center',
   },
   button: {
     backgroundColor: '#2196F3',
@@ -280,15 +485,26 @@ const styles = StyleSheet.create({
   },
   flipButton: {
     backgroundColor: 'rgba(255, 255, 255, 0.2)',
-    paddingHorizontal: 20,
+    paddingHorizontal: 15,
     paddingVertical: 10,
     borderRadius: 25,
     borderWidth: 1,
     borderColor: 'white',
   },
+  autoButton: {
+    backgroundColor: 'rgba(255, 165, 0, 0.3)',
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+    borderRadius: 25,
+    borderWidth: 2,
+    borderColor: '#FFA500',
+  },
+  activeButton: {
+    backgroundColor: 'rgba(255, 165, 0, 0.6)',
+  },
   captureButton: {
     backgroundColor: 'rgba(0, 255, 0, 0.3)',
-    paddingHorizontal: 20,
+    paddingHorizontal: 15,
     paddingVertical: 10,
     borderRadius: 25,
     borderWidth: 2,
@@ -299,7 +515,7 @@ const styles = StyleSheet.create({
     borderColor: 'gray',
   },
   buttonText: {
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: 'bold',
     color: 'white',
     textAlign: 'center',
