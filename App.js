@@ -3,11 +3,13 @@ import { Text, View, StyleSheet, TouchableOpacity, Alert } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as tf from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-react-native';
-import { bundleResourceIO } from '@tensorflow/tfjs-react-native';
+import { bundleResourceIO, decodeJpeg } from '@tensorflow/tfjs-react-native';
+import { Buffer } from 'buffer';
 import { getInfoAsync, documentDirectory } from 'expo-file-system/legacy';
 import { Asset } from 'expo-asset';
 
 export default function App() {
+  const cameraRef = useRef(null);
   const [facing, setFacing] = useState('back');
   const [permission, requestPermission] = useCameraPermissions();
   const [cameraReady, setCameraReady] = useState(false);
@@ -131,20 +133,15 @@ export default function App() {
         console.error('TensorFlow.js model loading failed:', tfjsError.message);
         // Note: Expo Go cannot run native TFLite; skip attempting TFLite here to avoid noisy errors.
         throw new Error(
-          'TensorFlow.js model failed to load. Ensure model.json is a valid TFJS GraphModel converted with the official converter. TFLite is not available in Expo Go.'
+          'TensorFlow.js model failed to load. Ensure model.json is a valid TFJS model (Layers or Graph) converted with the official converter. TFLite is not available in Expo Go.'
         );
       }
       
     } catch (error) {
       console.error('All model loading attempts failed:', error.message);
-      
-      // Fall back to simulated mode with detailed info
-      setModel({ 
-        loaded: true, 
-        simulated: true, 
-        reason: `Model loading failed: ${error.message}`,
-        suggestion: 'Using simulation mode for development. Provide a valid TFJS model to enable real inference.'
-      });
+      Alert.alert('Model Error', `Failed to load model: ${error.message}`);
+      // Do not enable simulated mode; keep model unavailable
+      setModel(null);
     }
   };
 
@@ -169,34 +166,36 @@ export default function App() {
   const MODEL_INPUT_SHAPE = [1, 70, 70, 1];
   const MODEL_OUTPUT_CLASSES = 52;
 
+  // Preprocess a base64 image into [1, H, W, 1] float32 tensor in [0,1]
+  const preprocessBase64Image = (base64, targetH, targetW) => {
+    try {
+      const bytes = Uint8Array.from(Buffer.from(base64, 'base64'));
+      const img = decodeJpeg(bytes, 3); // [H,W,3] uint8
+      const result = tf.tidy(() => {
+        const rgb = img.toFloat();
+        const [r, g, b] = tf.split(rgb, 3, 2);
+        const y = r.mul(0.299).add(g.mul(0.587)).add(b.mul(0.114)); // [H,W,1]
+        const resized = tf.image.resizeBilinear(y, [targetH, targetW], true);
+        const norm = resized.div(255.0); // [0,1]
+        return norm.expandDims(0); // [1,H,W,1]
+      });
+      img.dispose();
+      return result;
+    } catch (e) {
+      console.warn('Failed to preprocess image, falling back to dummy input:', e?.message);
+      return null;
+    }
+  };
+
   // Predict card from image
-  const predictCard = async (imageUri) => {
+  const predictCard = async (imageBase64) => {
     if (!model || isProcessing) return;
     
     setIsProcessing(true);
     
     try {
-      if (model.simulated) {
-        // Fallback to simulated prediction
-        console.log('Running simulated prediction. Reason:', model.reason);
-        await new Promise(resolve => setTimeout(resolve, 500));
-        
-        const randomIndex = Math.floor(Math.random() * cardClasses.length);
-        const confidence = (Math.random() * 0.3 + 0.7).toFixed(2);
-        
-        const prediction = {
-          card: cardClasses[randomIndex],
-          confidence: confidence
-        };
-        
-        console.log('Simulated card prediction:', prediction);
-        setLastPrediction(prediction);
-        triggerCardDetection(prediction);
-        return;
-      }
-
   // Real TensorFlow.js model prediction (supports layers and graph)
-  if (model.type?.startsWith('tfjs') && model.model) {
+      if (model.type?.startsWith('tfjs') && model.model) {
         console.log('Running TensorFlow.js model prediction...');
         
         // Create input tensor using model-declared shape if available
@@ -204,8 +203,15 @@ export default function App() {
         const inputShape = declared.map((d) => (d == null || d <= 0 ? 1 : d));
         console.log('Expected input shape:', inputShape);
         
-        // Create a fake input tensor for testing (replace with preprocessed camera frame)
-        const inputData = tf.randomNormal(inputShape);
+        // Build input tensor from camera (base64) if provided, else dummy tensor
+        let inputData = null;
+        if (!imageBase64) {
+          throw new Error('No image provided for prediction');
+        }
+        inputData = preprocessBase64Image(imageBase64, inputShape[1], inputShape[2]);
+        if (!inputData) {
+          throw new Error('Image preprocessing failed');
+        }
         
         // Run prediction
         let prediction = await model.model.predict(inputData);
@@ -309,9 +315,24 @@ export default function App() {
     }
 
     try {
-      // For now, just trigger prediction without actual image capture
-      // TODO: Implement actual camera frame capture
-      await predictCard('simulated_image_uri');
+      if (!cameraRef.current || !cameraRef.current.takePictureAsync) {
+        console.warn('Camera ref not ready');
+        Alert.alert('Camera Error', 'Camera not ready to capture a photo.');
+        return;
+      }
+
+      const photo = await cameraRef.current.takePictureAsync({
+        base64: true,
+        quality: 0.5,
+        skipProcessing: true,
+      });
+
+      if (!photo?.base64) {
+        console.warn('No base64 from camera');
+        Alert.alert('Capture Error', 'Failed to obtain image data from camera.');
+        return;
+      }
+      await predictCard(photo.base64);
       
     } catch (error) {
       console.error('Error capturing image:', error);
@@ -358,6 +379,7 @@ export default function App() {
       </View>
       
       <CameraView 
+        ref={cameraRef}
         style={styles.camera} 
         facing={facing}
         onCameraReady={handleCameraReady}
